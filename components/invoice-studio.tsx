@@ -1,0 +1,184 @@
+'use client';
+
+import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { ArrowDownToLine, ArrowLeft, ArrowUpRight, Check, CheckCheck, ChevronDown, ChevronRight, CircleHelp, Copy, Download, FilePlus2, FileText, Globe, LayoutGrid, ListFilter, Mail, MoreHorizontal, Plus, ReceiptText, Save, Search, Settings2, ShieldCheck, Sparkles, Trash2, Users, WifiOff, X } from 'lucide-react';
+import { calculateInvoice, createInvoice, defaultCompany, formatDate, formatMoney, validateInvoice, type Client, type Company, type Invoice, type LineItem } from '@/lib/invoice';
+import { parseBackup, parseCompany, parseStoredInvoices } from '@/lib/storage';
+
+type View = 'editor' | 'invoices' | 'clients' | 'settings';
+type InstallEvent = Event & { prompt: () => Promise<void>; userChoice: Promise<{ outcome: string }> };
+const STORAGE = 'seladevs-invoice-studio-v1';
+const COMPANY_STORAGE = 'seladevs-company-v1';
+
+function Field({ label, children, className = '' }: { label: string; children: ReactNode; className?: string }) {
+  return <label className={`field ${className}`}><span>{label}</span>{children}</label>;
+}
+function Section({ step, title, detail, children }: { step: string; title: string; detail?: string; children: ReactNode }) {
+  return <section className="editor-card"><header className="section-heading"><span className="step">{step}</span><div><h2>{title}</h2>{detail && <p>{detail}</p>}</div></header>{children}</section>;
+}
+function Brand({ small = false }: { small?: boolean }) {
+  return <div className={`brand ${small ? 'brand-small' : ''}`}><img src="/brand/seladevs-logo.png" alt="Seladevs logo" /><div><strong>SELADEVS<span>.</span></strong><small>{small ? 'CODE. CREATE. COLLABORATE.' : 'Invoice Studio'}</small></div></div>;
+}
+function InvoicePaper({ invoice, compact = false }: { invoice: Invoice; compact?: boolean }) {
+  const totals = calculateInvoice(invoice);
+  return <article className={`invoice-paper ${compact ? 'compact-paper' : ''}`} aria-label="Invoice preview">
+    <div className="paper-top"><Brand small /><div className="invoice-label"><h2>INVOICE</h2><p>{invoice.number || 'Invoice number'}</p></div></div>
+    <div className="paper-sender"><strong>{invoice.from.name || 'Seladevs'}</strong>{invoice.from.address && <p className="multiline">{invoice.from.address}</p>}<p>{[invoice.from.email, invoice.from.phone].filter(Boolean).join(' · ')}</p><p>{invoice.from.website}</p>{invoice.from.registration && <p>Registration: {invoice.from.registration}</p>}{invoice.from.taxId && <p>Tax ID / SST: {invoice.from.taxId}</p>}</div>
+    <div className="paper-parties"><div><span className="paper-eyebrow">BILL TO</span><h3 className={!invoice.client.name ? 'placeholder-text' : ''}>{invoice.client.name || "Your client's company"}</h3><p className="multiline">{invoice.client.address || 'Client address'}</p>{invoice.client.email && <p>{invoice.client.email}</p>}{invoice.client.registration && <p>Reg: {invoice.client.registration}</p>}</div><dl><div><dt>Invoice date</dt><dd>{formatDate(invoice.issueDate)}</dd></div><div><dt>Due date</dt><dd>{formatDate(invoice.dueDate)}</dd></div><div><dt>Currency</dt><dd>{invoice.currency}</dd></div>{invoice.reference && <div><dt>Reference</dt><dd>{invoice.reference}</dd></div>}</dl></div>
+    <table className="paper-items"><thead><tr><th>DESCRIPTION</th><th>QTY</th><th>RATE</th><th>AMOUNT</th></tr></thead><tbody>{invoice.items.map((item) => <tr key={item.id}><td><strong>{item.description || 'Service description'}</strong>{item.details && <span>{item.details}</span>}</td><td>{item.quantity}</td><td>{formatMoney(item.rate, invoice.currency)}</td><td>{formatMoney(calculateInvoice({ ...invoice, items: [item], discountRate: 0, taxRate: 0 }).subtotal, invoice.currency)}</td></tr>)}</tbody></table>
+    <div className="paper-summary"><div className="paper-summary-note"><span className="paper-eyebrow">A LITTLE NOTE</span><p className="multiline">{invoice.notes || 'Thank you for your business.'}</p></div><dl><div><dt>Subtotal</dt><dd>{formatMoney(totals.subtotal, invoice.currency)}</dd></div>{invoice.discountRate > 0 && <div><dt>Discount ({invoice.discountRate}%)</dt><dd>−{formatMoney(totals.discount, invoice.currency)}</dd></div>}<div><dt>Tax ({invoice.taxRate}%)</dt><dd>{formatMoney(totals.tax, invoice.currency)}</dd></div>{totals.paid > 0 && <><div><dt>Total</dt><dd>{formatMoney(totals.total, invoice.currency)}</dd></div><div><dt>Amount paid</dt><dd>−{formatMoney(totals.paid, invoice.currency)}</dd></div></>}<div className="paper-total"><dt>Amount due</dt><dd>{formatMoney(totals.balance, invoice.currency)}</dd></div></dl></div>
+    <div className="paper-payment"><div><span className="paper-eyebrow">PAYMENT DETAILS</span>{invoice.bankName || invoice.accountNumber ? <><p><strong>{invoice.bankName}</strong></p><p>{invoice.accountName}</p><p className="account-number">{invoice.accountNumber}</p><p>Reference: {invoice.number}</p></> : <p>Contact {invoice.from.email || invoice.from.name} for payment details.</p>}</div><div><span className="paper-eyebrow">TERMS & CONDITIONS</span><p className="multiline">{invoice.terms}</p></div></div>
+    <footer className="paper-footer"><span>Made with care. Built by Seladevs.</span><span>{invoice.from.website || 'seladevs.my'}</span></footer>
+  </article>;
+}
+
+export default function InvoiceStudio() {
+  const [view, setView] = useState<View>('editor');
+  const [invoice, setInvoice] = useState<Invoice | null>(null);
+  const [invoices, setInvoices] = useState<Invoice[]>([]);
+  const [company, setCompany] = useState<Company>(defaultCompany);
+  const [toast, setToast] = useState('');
+  const [saved, setSaved] = useState(false);
+  const [storageAvailable, setStorageAvailable] = useState(true);
+  const [offline, setOffline] = useState(false);
+  const [installEvent, setInstallEvent] = useState<InstallEvent | null>(null);
+  const [installed, setInstalled] = useState(false);
+  const [modal, setModal] = useState<'help' | 'install' | 'preview' | null>(null);
+  const [errors, setErrors] = useState<string[]>([]);
+  const [search, setSearch] = useState('');
+  const [filter, setFilter] = useState('all');
+  const [paymentOpen, setPaymentOpen] = useState(false);
+  const [mobileMenu, setMobileMenu] = useState(false);
+  const [deleteId, setDeleteId] = useState<string | null>(null);
+  const ready = useRef(false);
+  const invoicesRef = useRef<Invoice[]>([]);
+  const invoiceRef = useRef<Invoice | null>(null);
+  const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  function notify(message: string) { setToast(message); if (toastTimer.current) clearTimeout(toastTimer.current); toastTimer.current = setTimeout(() => setToast(''), 3800); }
+  useEffect(() => {
+    let loaded: Invoice[] = []; let profile = defaultCompany;
+    try {
+      loaded = parseStoredInvoices(JSON.parse(localStorage.getItem(STORAGE) || '[]'));
+      profile = parseCompany(JSON.parse(localStorage.getItem(COMPANY_STORAGE) || 'null')) || defaultCompany;
+    } catch { setStorageAvailable(false); }
+    const active = loaded[0] || createInvoice(profile, loaded);
+    setCompany(profile); setInvoices(loaded); invoicesRef.current = loaded; setInvoice(active); invoiceRef.current = active; ready.current = true;
+    setOffline(!navigator.onLine); setInstalled(window.matchMedia('(display-mode: standalone)').matches);
+    const online = () => setOffline(false); const offline = () => setOffline(true);
+    const install = (event: Event) => { event.preventDefault(); setInstallEvent(event as InstallEvent); };
+    const didInstall = () => { setInstalled(true); setInstallEvent(null); };
+    const flush = () => { if (invoiceRef.current) { const next = [invoiceRef.current, ...invoicesRef.current.filter(i => i.id !== invoiceRef.current?.id)]; try { localStorage.setItem(STORAGE, JSON.stringify(next)); } catch { /* Storage failure is shown during normal editing. */ } } };
+    const onHidden = () => { if (document.visibilityState === 'hidden') flush(); };
+    window.addEventListener('online', online); window.addEventListener('offline', offline); window.addEventListener('beforeinstallprompt', install); window.addEventListener('appinstalled', didInstall);
+    window.addEventListener('pagehide', flush); document.addEventListener('visibilitychange', onHidden);
+    if ('serviceWorker' in navigator && process.env.NODE_ENV === 'production') navigator.serviceWorker.register('/sw.js', { scope: '/', updateViaCache: 'none' }).catch(() => notify('Offline setup could not finish. You can keep working online.'));
+    return () => { window.removeEventListener('online', online); window.removeEventListener('offline', offline); window.removeEventListener('beforeinstallprompt', install); window.removeEventListener('appinstalled', didInstall); window.removeEventListener('pagehide', flush); document.removeEventListener('visibilitychange', onHidden); if (toastTimer.current) clearTimeout(toastTimer.current); };
+  }, []);
+
+  function persist(next: Invoice[]) {
+    invoicesRef.current = next; setInvoices(next);
+    try { localStorage.setItem(STORAGE, JSON.stringify(next)); setSaved(true); setStorageAvailable(true); return true; }
+    catch { setSaved(false); setStorageAvailable(false); return false; }
+  }
+  useEffect(() => {
+    if (!invoice || !ready.current) return;
+    setSaved(false);
+    const timer = setTimeout(() => {
+      persist([invoice, ...invoicesRef.current.filter(item => item.id !== invoice.id)]);
+    }, 650);
+    return () => clearTimeout(timer);
+  }, [invoice]);
+
+  useEffect(() => {
+    if (!modal && !deleteId) return;
+    const previous = document.activeElement as HTMLElement | null;
+    const dialog = document.querySelector<HTMLElement>('[role="dialog"]');
+    const selector = 'button, a[href], input, select, textarea, [tabindex="0"]';
+    dialog?.querySelector<HTMLElement>(selector)?.focus();
+    const keyboard = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') { setModal(null); setDeleteId(null); return; }
+      if (event.key !== 'Tab' || !dialog) return;
+      const elements = Array.from(dialog.querySelectorAll<HTMLElement>(selector));
+      const first = elements[0]; const last = elements[elements.length - 1];
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
+    };
+    document.addEventListener('keydown', keyboard);
+    return () => { document.removeEventListener('keydown', keyboard); previous?.focus(); };
+  }, [modal, deleteId]);
+
+  function update(patch: Partial<Invoice>) {
+    const current = invoiceRef.current;
+    if (!current) return;
+    const next = { ...current, ...patch, updatedAt: new Date().toISOString() };
+    if (patch.status === 'unpaid' && calculateInvoice(next).balance === 0) next.amountPaid = 0;
+    if (next.status !== 'draft') next.status = calculateInvoice(next).balance === 0 ? 'paid' : 'unpaid';
+    invoiceRef.current = next; setInvoice(next); setErrors([]);
+  }
+  function updateItem(id: string, patch: Partial<LineItem>) { if (invoice) update({ items: invoice.items.map(item => item.id === id ? { ...item, ...patch } : item) }); }
+  function commitCurrent() { const active = invoiceRef.current; const next = active ? [active, ...invoicesRef.current.filter(item => item.id !== active.id)] : invoicesRef.current; persist(next); return next; }
+  function saveDraft() { if (!invoiceRef.current) return; const next = [invoiceRef.current, ...invoicesRef.current.filter(item => item.id !== invoiceRef.current?.id)]; notify(persist(next) ? 'Invoice saved on this device.' : 'Device storage is full. Export a backup to keep your invoice.'); }
+  function selectInvoice(next: Invoice | null) { invoiceRef.current = next; setInvoice(next); setErrors([]); }
+  function newInvoice() {
+    const existing = commitCurrent();
+    selectInvoice(createInvoice(company, existing)); setView('editor'); setMobileMenu(false);
+  }
+  function openInvoice(item: Invoice) { const existing = commitCurrent(); selectInvoice(existing.find(i => i.id === item.id) || item); setView('editor'); }
+  function duplicateInvoice(item: Invoice) { const existing = commitCurrent(); const base = createInvoice(company, existing); selectInvoice({ ...item, id: base.id, number: base.number, status: 'draft', amountPaid: 0, updatedAt: base.updatedAt }); setView('editor'); notify('Invoice duplicated with a new number.'); }
+  function createForClient(client: Client) { const existing = commitCurrent(); selectInvoice({ ...createInvoice(company, existing), client: { ...client } }); setView('editor'); }
+  function exportPdf() {
+    if (!invoice) return;
+    const issues = validateInvoice(invoice);
+    if (invoices.some(other => other.id !== invoice.id && other.number.trim() === invoice.number.trim())) issues.push('This invoice number is already used. Choose a unique number.');
+    if (issues.length) { setErrors(issues); setView('editor'); setModal(null); notify('A few details need your attention before exporting.'); return; }
+    saveDraft(); document.title = `${invoice.number} - ${invoice.from.name}`;
+    window.print(); document.title = 'Invoice Studio · Seladevs';
+  }
+  function downloadBackup() { const current = invoice ? [invoice, ...invoices.filter(i => i.id !== invoice.id)] : invoices; const blob = new Blob([JSON.stringify({ version: 1, company, invoices: current }, null, 2)], { type: 'application/json' }); const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = 'seladevs-invoices-backup.json'; a.click(); setTimeout(() => URL.revokeObjectURL(url), 1000); notify('Backup downloaded. Keep it somewhere safe.'); }
+  async function importBackup(file?: File) {
+    if (!file) return;
+    try {
+      if (file.size > 20 * 1024 * 1024) throw new Error('Backup is too large.');
+      const data = parseBackup(JSON.parse(await file.text()));
+      const existing = commitCurrent(); const restored = data.invoices;
+      const merged = [...restored, ...existing.filter(item => !restored.some(r => r.id === item.id))];
+      persist(merged); if (data.company) { localStorage.setItem(COMPANY_STORAGE, JSON.stringify(data.company)); setCompany(data.company); }
+      if (merged[0]) selectInvoice(merged[0]); notify(`Restored ${restored.length} invoice${restored.length === 1 ? '' : 's'}.`);
+    } catch { notify('This file is not a valid Seladevs invoice backup.'); }
+  }
+  async function installApp() { if (installEvent) { await installEvent.prompt(); const choice = await installEvent.userChoice; if (choice.outcome === 'accepted') setInstallEvent(null); } else setModal('install'); }
+  function saveCompany(event: React.FormEvent<HTMLFormElement>) { event.preventDefault(); try { localStorage.setItem(COMPANY_STORAGE, JSON.stringify(company)); setStorageAvailable(true); if (invoice) update({ from: { ...company } }); notify('Company profile saved. Your current invoice is updated.'); } catch { notify('Could not save your profile. Device storage is unavailable.'); } }
+  const totals = invoice ? calculateInvoice(invoice) : null;
+  const filtered = invoices.filter(item => (filter === 'all' || item.status === filter) && `${item.number} ${item.client.name}`.toLowerCase().includes(search.toLowerCase()));
+  const clients = Array.from(new Map(invoices.filter(item => item.client.name).map(item => [item.client.name.toLowerCase(), item.client])).values());
+
+  return <div className="app-shell">
+    <aside className={`sidebar ${mobileMenu ? 'sidebar-open' : ''}`}><a className="brand-link" href="#" onClick={event => { event.preventDefault(); if (invoiceRef.current) setView('editor'); else newInvoice(); }}><Brand /></a><button className="workspace-switch" onClick={() => { setView('settings'); setMobileMenu(false); }}><span className="workspace-icon">s.</span><span><strong>Seladevs workspace</strong><small><span className="green-dot" /> Personal workspace</small></span><ChevronDown size={14} /></button>
+      <span className="nav-caption">WORKSPACE</span><nav aria-label="Main navigation"><button className={view === 'editor' ? 'nav-active' : ''} onClick={() => { if (invoiceRef.current) setView('editor'); else newInvoice(); setMobileMenu(false); }}><FilePlus2 size={18} />Invoice generator<span className="nav-plus">+</span></button><button className={view === 'invoices' ? 'nav-active' : ''} onClick={() => { setView('invoices'); setMobileMenu(false); }}><ReceiptText size={18} />My invoices<span className="nav-count">{invoices.length}</span></button><button className={view === 'clients' ? 'nav-active' : ''} onClick={() => { setView('clients'); setMobileMenu(false); }}><Users size={18} />Clients</button><div className="nav-divider" /><button className={view === 'settings' ? 'nav-active' : ''} onClick={() => { setView('settings'); setMobileMenu(false); }}><Settings2 size={18} />Company settings</button><button onClick={() => setModal('help')}><CircleHelp size={18} />Help & resources<ArrowUpRight size={13} className="nav-end" /></button></nav>
+      <div className="sidebar-bottom">{!installed && <div className="install-card"><div className="install-card-icon"><ArrowDownToLine size={19} /><Sparkles size={12} /></div><strong>Your studio, anywhere.</strong><p>Install the app. Make invoices even when you’re offline.</p><button onClick={installApp}>Install app<ArrowUpRight size={14} /></button></div>}<a className="website-link" href="https://seladevs.my" target="_blank" rel="noreferrer"><Globe size={15} />Visit seladevs.my<ArrowUpRight size={13} /></a><div className="sidebar-profile"><div className="profile-avatar">SD</div><div><strong>Seladevs</strong><small>Let’s build something.</small></div><span className="green-dot" /></div></div>
+    </aside>
+    {mobileMenu && <button className="sidebar-backdrop" aria-label="Close navigation" onClick={() => setMobileMenu(false)} />}
+    <div className="app-main"><header className="topbar"><button className="mobile-menu icon-button" aria-label="Open navigation" onClick={() => setMobileMenu(true)}><LayoutGrid size={20} /></button><div className="breadcrumbs"><span>Workspace</span><ChevronRight size={12} /><span>Invoices</span><ChevronRight size={12} /><strong>{view === 'editor' ? 'Invoice generator' : view === 'invoices' ? 'My invoices' : view === 'clients' ? 'Clients' : 'Company settings'}</strong></div><div className="topbar-status"><span className={offline ? 'amber-dot' : 'green-dot'} />{offline ? 'Working offline' : 'Your work, saved locally'}<span className="topbar-divider" /><button className="icon-button" aria-label="Open help" onClick={() => setModal('help')}><CircleHelp size={18} /></button></div></header>
+      <main className="main-content"><div className="page-heading"><div><div className="eyebrow"><span /> SELADEVS INVOICE STUDIO</div><h1>{view === 'editor' ? 'Good work. Great invoices.' : view === 'invoices' ? 'Your work, on record.' : view === 'clients' ? 'Good people. Great projects.' : 'Make it yours.'}</h1><p>{view === 'editor' ? 'A little less admin. A little more building.' : view === 'invoices' ? 'Every project, every payment. All in one place.' : view === 'clients' ? 'Your clients, collected from your saved invoices.' : 'The details behind every invoice you create.'}</p></div><div className="page-actions">{view === 'editor' ? <><button className="button button-secondary" onClick={saveDraft}><Save size={15} />Save draft</button><button className="button button-primary" onClick={exportPdf}><Download size={16} />Export PDF</button></> : <button className="button button-primary" onClick={newInvoice}><Plus size={17} />New invoice</button>}</div></div>
+      {!storageAvailable && <div className="notice notice-warning"><ShieldCheck size={17} /><span>Device storage is unavailable. Download a backup to keep your work.</span><button onClick={downloadBackup}>Download backup</button></div>}
+      {offline && <div className="notice"><WifiOff size={17} />You’re offline. Editing, saving and printing still work on this device.</div>}
+      {view === 'editor' && invoice && totals && <><div className="editor-toolbar"><div><span className="draft-badge"><span />{invoice.status === 'draft' ? 'Draft invoice' : invoice.status === 'paid' ? 'Paid invoice' : 'Unpaid invoice'}</span><span className="autosave"><CheckCheck size={14} />{saved ? 'All changes saved' : 'Saving changes…'}</span></div><button onClick={newInvoice}><Plus size={14} />Start fresh</button></div><div className="studio-grid"><div className="editor-column">
+        {errors.length > 0 && <div className="validation-errors" role="alert"><strong>Let’s finish a few details</strong><ul>{errors.map(error => <li key={error}>{error}</li>)}</ul></div>}
+        <Section step="01" title="Invoice details" detail="Start with the essentials."><div className="fields-grid"><Field label="Invoice number"><input value={invoice.number} onChange={e => update({ number: e.target.value })} /></Field><Field label="Currency"><select value={invoice.currency} onChange={e => update({ currency: e.target.value as Invoice['currency'] })}><option value="MYR">MYR — Malaysian Ringgit</option><option value="USD">USD — US Dollar</option><option value="SGD">SGD — Singapore Dollar</option></select></Field><Field label="Invoice date"><input type="date" value={invoice.issueDate} onChange={e => update({ issueDate: e.target.value })} /></Field><Field label="Due date"><input type="date" value={invoice.dueDate} min={invoice.issueDate} onChange={e => update({ dueDate: e.target.value })} /></Field><Field label="Project / PO reference" className="field-wide"><input placeholder="e.g. Website redesign" value={invoice.reference} onChange={e => update({ reference: e.target.value })} /></Field></div></Section>
+        <Section step="02" title="Who’s the invoice for?" detail="Add your client’s billing details."><div className="fields-grid"><Field label="Client / company name" className="field-wide"><div className="input-with-icon"><Users size={15} /><input list="client-names" placeholder="Enter client or company name" value={invoice.client.name} onChange={e => { const client = clients.find(c => c.name === e.target.value); update({ client: client ? { ...client } : { ...invoice.client, name: e.target.value } }); }} /><datalist id="client-names">{clients.map(c => <option key={c.name} value={c.name} />)}</datalist></div></Field><Field label="Email address"><input type="email" placeholder="hello@company.com" value={invoice.client.email} onChange={e => update({ client: { ...invoice.client, email: e.target.value } })} /></Field><Field label="Registration no. (optional)"><input placeholder="Business registration number" value={invoice.client.registration} onChange={e => update({ client: { ...invoice.client, registration: e.target.value } })} /></Field><Field label="Billing address" className="field-wide"><textarea rows={2} placeholder="Street address, city, postcode, country" value={invoice.client.address} onChange={e => update({ client: { ...invoice.client, address: e.target.value } })} /></Field></div></Section>
+        <Section step="03" title="Items & services" detail="Give your good work a line of its own."><div className="line-items-editor"><div className="items-labels"><span>DESCRIPTION</span><span>QTY</span><span>RATE ({invoice.currency})</span><span /></div>{invoice.items.map((item, index) => <div className="line-item" key={item.id}><div className="item-description"><input aria-label={`Item ${index + 1} description`} placeholder="Service or item name" value={item.description} onChange={e => updateItem(item.id, { description: e.target.value })} /><input className="item-detail" aria-label={`Item ${index + 1} details`} placeholder="Add a little detail (optional)" value={item.details} onChange={e => updateItem(item.id, { details: e.target.value })} /></div><input aria-label={`Item ${index + 1} quantity`} type="number" min="0.01" step="0.01" value={item.quantity} onChange={e => updateItem(item.id, { quantity: Number(e.target.value) })} /><input aria-label={`Item ${index + 1} rate`} type="number" min="0" step="0.01" value={item.rate} onChange={e => updateItem(item.id, { rate: Number(e.target.value) })} /><button className="icon-button delete-item" aria-label={`Remove item ${index + 1}`} onClick={() => update({ items: invoice.items.filter(i => i.id !== item.id) })}><Trash2 size={15} /></button></div>)}</div><button className="add-item" onClick={() => update({ items: [...invoice.items, { id: crypto.randomUUID(), description: '', details: '', quantity: 1, rate: 0 }] })}><Plus size={15} />Add line item</button><div className="adjustments"><Field label="Discount (%)"><input type="number" min="0" max="100" step="0.01" value={invoice.discountRate} onChange={e => update({ discountRate: Number(e.target.value) })} /></Field><Field label="Tax (%)"><input type="number" min="0" max="100" step="0.01" value={invoice.taxRate} onChange={e => update({ taxRate: Number(e.target.value) })} /></Field><div className="editor-total"><span>INVOICE TOTAL</span><strong>{formatMoney(totals.total, invoice.currency)}</strong></div></div><p className="field-hint">Only add tax if it applies to your business.</p></Section>
+        <Section step="04" title="The finishing touches"><div className="fields-grid"><Field label="A note for your client" className="field-wide"><textarea rows={2} value={invoice.notes} onChange={e => update({ notes: e.target.value })} /></Field><Field label="Payment terms" className="field-wide"><textarea rows={2} value={invoice.terms} onChange={e => update({ terms: e.target.value })} /></Field><Field label="Amount already paid"><input type="number" min="0" step="0.01" max={totals.total} value={invoice.amountPaid} onChange={e => update({ amountPaid: Number(e.target.value) })} /></Field><Field label="Invoice status"><select value={invoice.status} onChange={e => { const status = e.target.value as Invoice['status']; update({ status, ...(status === 'paid' ? { amountPaid: totals.total } : {}) }); }}><option value="draft">Draft</option><option value="unpaid">Unpaid</option><option value="paid">Paid</option></select></Field></div><button className={`payment-toggle ${paymentOpen ? 'is-open' : ''}`} onClick={() => setPaymentOpen(!paymentOpen)}><span><ReceiptText size={16} />Bank & payment details</span><ChevronDown size={16} /></button>{paymentOpen && <div className="fields-grid payment-fields"><Field label="Bank name"><input placeholder="Your bank" value={invoice.bankName} onChange={e => update({ bankName: e.target.value })} /></Field><Field label="Account name"><input placeholder="Account holder name" value={invoice.accountName} onChange={e => update({ accountName: e.target.value })} /></Field><Field label="Account number" className="field-wide"><input placeholder="Bank account number" value={invoice.accountNumber} onChange={e => update({ accountNumber: e.target.value })} /></Field></div>}</Section>
+        <div className="privacy-note"><ShieldCheck size={15} /><p>Your invoices stay in this browser, on this device.<br /><button onClick={downloadBackup}>Download a backup</button> to keep an extra copy.</p></div>
+      </div><aside className="preview-column"><div className="preview-heading"><span><span className="live-dot" />LIVE PREVIEW</span><div><span>A4 · Portrait</span><button className="icon-button" aria-label="Expand invoice preview" onClick={() => setModal('preview')}><ArrowUpRight size={16} /></button></div></div><div className="paper-container"><InvoicePaper invoice={invoice} compact /></div><div className="preview-bottom"><ShieldCheck size={14} /><span>Polished, professional, and ready to send.</span></div><button className="preview-expand" onClick={() => setModal('preview')}>Take a closer look<ArrowUpRight size={14} /></button></aside></div></>}
+      {view === 'invoices' && <section className="collection-card"><div className="collection-toolbar"><div className="search-input"><Search size={17} /><input aria-label="Search invoices" placeholder="Search invoices or clients…" value={search} onChange={e => setSearch(e.target.value)} /></div><select aria-label="Filter invoices by status" value={filter} onChange={e => setFilter(e.target.value)}><option value="all">All invoices</option><option value="draft">Draft</option><option value="unpaid">Unpaid</option><option value="paid">Paid</option></select><button className="button button-secondary" onClick={downloadBackup}><Download size={15} />Backup</button></div>{filtered.length ? <div className="table-scroll"><table className="collection-table"><thead><tr><th>INVOICE</th><th>CLIENT</th><th>DUE DATE</th><th>STATUS</th><th>AMOUNT DUE</th><th /></tr></thead><tbody>{filtered.map(item => <tr key={item.id}><td><button className="text-link" onClick={() => openInvoice(item)}>{item.number}</button></td><td>{item.client.name || 'No client yet'}</td><td>{formatDate(item.dueDate)}</td><td><span className={`status-pill status-${item.status}`}>{item.status}</span></td><td>{formatMoney(calculateInvoice(item).balance, item.currency)}</td><td><div className="row-actions"><button className="icon-button" aria-label={`Duplicate ${item.number}`} onClick={() => duplicateInvoice(item)}><Copy size={15} /></button><button className="icon-button" aria-label={`Delete ${item.number}`} onClick={() => setDeleteId(item.id)}><Trash2 size={15} /></button></div></td></tr>)}</tbody></table></div> : <div className="empty-state"><FileText size={34} /><h2>{search || filter !== 'all' ? 'No matching invoices' : 'Your next project starts here.'}</h2><p>{search || filter !== 'all' ? 'Try a different search or filter.' : 'Create an invoice and it will be saved here automatically.'}</p><button className="button button-primary" onClick={newInvoice}><Plus size={16} />Create invoice</button></div>}</section>}
+      {view === 'clients' && <div className="clients-grid">{clients.length ? clients.map(client => <div className="client-card" key={client.name}><div className="client-avatar">{client.name.slice(0, 2).toUpperCase()}</div><h2>{client.name}</h2><p>{client.email || 'No email added'}</p><p className="multiline">{client.address}</p><button className="button button-secondary" onClick={() => createForClient(client)}>Create invoice<ArrowUpRight size={15} /></button></div>) : <div className="collection-card empty-state"><Users size={34} /><h2>Meet your client list.</h2><p>Add a client to an invoice and they’ll appear here.</p><button className="button button-primary" onClick={() => setView('editor')}>Add your first client<ArrowUpRight size={15} /></button></div>}</div>}
+      {view === 'settings' && <div className="settings-grid"><form className="editor-card" onSubmit={saveCompany}><header className="section-heading"><span className="step"><Settings2 size={17} /></span><div><h2>Company profile</h2><p>The sender details on your invoices.</p></div></header><div className="settings-brand"><Brand /><span className="verified-label"><Check size={12} />Official brand assets</span></div><div className="fields-grid">{([['name', 'Company / legal name'], ['email', 'Email address'], ['phone', 'Phone number'], ['website', 'Website'], ['registration', 'Business registration no.'], ['taxId', 'Tax ID / SST registration']] as const).map(([key, label]) => <Field key={key} label={label}><input type={key === 'email' ? 'email' : 'text'} required={key === 'name'} value={company[key]} onChange={e => setCompany({ ...company, [key]: e.target.value })} /></Field>)}<Field label="Company address" className="field-wide"><textarea rows={3} placeholder="Add your official business address" value={company.address} onChange={e => setCompany({ ...company, address: e.target.value })} /></Field></div><button className="button button-primary settings-save" type="submit"><Check size={16} />Save company profile</button></form><aside><div className="settings-info"><ShieldCheck size={23} /><h2>Yours, by design.</h2><p>Your data is stored in this browser. Export a backup to move invoices to another device or keep a safe copy.</p><button className="button button-secondary" onClick={downloadBackup}><Download size={15} />Export backup</button><label className="button button-secondary import-label"><ArrowUpRight size={15} />Import invoices<input type="file" accept="application/json,.json" onChange={e => { void importBackup(e.target.files?.[0]); e.target.value = ''; }} /></label></div><div className="settings-info research-info"><FileText size={21} /><h2>Built around the essentials.</h2><p>Clear billing details, itemized services, payment terms and a prominent amount due.</p><p>This app creates regular invoices. MyInvois e-Invoice validation requires a separate submission to HASiL.</p><a href="https://www.smallbusinesscommissioner.gov.uk/help-and-guidance/all-advice/a-guide-for-effective-invoicing/" target="_blank" rel="noreferrer">Professional invoice guidance<ArrowUpRight size={13} /></a><a href="https://sdk.myinvois.hasil.gov.my/documents/invoice-v1-1/" target="_blank" rel="noreferrer">MyInvois specification<ArrowUpRight size={13} /></a></div></aside></div>}
+      <footer className="app-footer"><span>Built for the people who build.</span><span>SELADEVS <span className="footer-spark">✳</span> {new Date().getFullYear()}</span></footer></main>
+    </div>
+    {invoice && <div className="print-only"><InvoicePaper invoice={invoice} /></div>}
+    {toast && <div className="toast" role="status"><Check size={17} />{toast}<button aria-label="Dismiss notification" onClick={() => setToast('')}><X size={14} /></button></div>}
+    {modal && <div className="modal-backdrop" onClick={() => setModal(null)}><section className={`modal ${modal === 'preview' ? 'preview-modal' : ''}`} role="dialog" aria-modal="true" aria-label={modal === 'preview' ? 'Full invoice preview' : modal === 'help' ? 'Help and resources' : 'Install Invoice Studio'} onClick={e => e.stopPropagation()}><button className="modal-close icon-button" aria-label="Close dialog" onClick={() => setModal(null)}><X size={20} /></button>{modal === 'preview' && invoice ? <><div className="modal-preview-bar"><span>YOUR INVOICE, READY FOR ITS CLOSE-UP.</span><button className="button button-primary" onClick={exportPdf}><Download size={15} />Export PDF</button></div><InvoicePaper invoice={invoice} /></> : modal === 'help' ? <><span className="dialog-icon"><CircleHelp size={27} /></span><h2>A few things to know.</h2><div className="help-step"><b>01</b><div><h3>Make it yours</h3><p>Add your legal company and payment details in company settings and the invoice editor.</p></div></div><div className="help-step"><b>02</b><div><h3>Fill in the good stuff</h3><p>Add a client, services, dates and terms. Your draft saves automatically on this device.</p></div></div><div className="help-step"><b>03</b><div><h3>Export and send</h3><p>Choose Export PDF, then “Save as PDF” in the print dialog. Select A4 and turn off browser headers and footers.</p></div></div><p className="help-footnote">Regular invoices are supported. This app does not submit or validate e-Invoices with MyInvois.</p><a className="text-link" href="https://sdk.myinvois.hasil.gov.my/documents/invoice-v1-1/" target="_blank" rel="noreferrer">Read the MyInvois guide<ArrowUpRight size={13} /></a></> : <><span className="dialog-icon"><ArrowDownToLine size={27} /></span><h2>A home for your studio.</h2><p>Install Invoice Studio for a focused app experience and offline access.</p><div className="install-instructions"><h3>Chrome or Edge</h3><p>Open this site in your browser. Choose the install icon in the address bar, or the browser menu → Install app.</p><h3>iPhone or iPad</h3><p>Open in Safari, tap Share, then “Add to Home Screen”.</p></div><p className="help-footnote">Visit once while online to prepare the app for offline use. Your invoices stay on this device.</p></>}</section></div>}
+    {deleteId && <div className="modal-backdrop"><section className="modal" role="dialog" aria-modal="true" aria-label="Delete invoice"><span className="dialog-icon"><Trash2 size={25} /></span><h2>Delete this invoice?</h2><p>This removes it from this device. Export a backup first if you need a copy.</p><div className="dialog-actions"><button className="button button-secondary" onClick={() => setDeleteId(null)}>Keep invoice</button><button className="button button-primary" onClick={() => { const next = invoicesRef.current.filter(i => i.id !== deleteId); persist(next); if (invoiceRef.current?.id === deleteId) selectInvoice(next[0] || null); setView('invoices'); setDeleteId(null); notify('Invoice deleted.'); }}>Delete invoice</button></div></section></div>}
+  </div>;
+}
